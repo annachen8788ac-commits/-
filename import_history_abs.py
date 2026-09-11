@@ -3,6 +3,7 @@ import base64
 import csv
 import gzip
 import io
+import json
 import lzma
 import os
 import re
@@ -16,21 +17,111 @@ BASE = Path("/app")
 REQUIRED = {"history_id", "date_text", "sender_name", "full_number"}
 
 
-def parse_csv(data: bytes):
-    candidates = [data]
-    for fn in (lzma.decompress, gzip.decompress, zlib.decompress):
+def unpack_candidates(data: bytes):
+    out = [("raw", data)]
+    for name, fn in (("xz", lzma.decompress), ("gzip", gzip.decompress), ("zlib", zlib.decompress)):
         try:
-            candidates.append(fn(data))
+            out.append((name, fn(data)))
         except Exception:
             pass
-    for blob in candidates:
+    return out
+
+
+def inspect_blob(label: str, blob: bytes):
+    info = {"label": label, "bytes": len(blob), "utf8": False, "format": "binary", "fields": []}
+    try:
+        text = blob.decode("utf-8-sig")
+    except Exception:
+        print(f"history inspect: {label} bytes={len(blob)} utf8=no format=binary", flush=True)
+        return info
+
+    info["utf8"] = True
+    stripped = text.lstrip()
+
+    # JSON / JSONL
+    if stripped.startswith("[") or stripped.startswith("{"):
         try:
-            text = blob.decode("utf-8-sig")
+            obj = json.loads(text)
+            info["format"] = "json"
+            if isinstance(obj, list) and obj and isinstance(obj[0], dict):
+                info["fields"] = sorted(obj[0].keys())
+            elif isinstance(obj, dict):
+                info["fields"] = sorted(obj.keys())
+            print(f"history inspect: {label} bytes={len(blob)} utf8=yes format=json fields={info['fields']}", flush=True)
+            return info
         except Exception:
-            continue
-        reader = csv.DictReader(io.StringIO(text))
-        if reader.fieldnames and REQUIRED.issubset(set(reader.fieldnames)):
-            return list(reader), reader.fieldnames
+            pass
+
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if lines:
+        try:
+            sample_objs = []
+            for ln in lines[:5]:
+                v = json.loads(ln)
+                if isinstance(v, dict):
+                    sample_objs.append(v)
+            if sample_objs:
+                info["format"] = "jsonl"
+                info["fields"] = sorted(sample_objs[0].keys())
+                print(f"history inspect: {label} bytes={len(blob)} utf8=yes format=jsonl fields={info['fields']}", flush=True)
+                return info
+        except Exception:
+            pass
+
+    # Delimited text. Only field names are emitted.
+    for delim, fmt in ((",", "csv"), ("\t", "tsv"), (";", "semicolon"), ("|", "pipe")):
+        try:
+            reader = csv.reader(io.StringIO(text), delimiter=delim)
+            header = next(reader, [])
+            if len(header) >= 2:
+                fields = [str(x).strip() for x in header]
+                info["format"] = fmt
+                info["fields"] = fields
+                print(f"history inspect: {label} bytes={len(blob)} utf8=yes format={fmt} fields={fields}", flush=True)
+                return info
+        except Exception:
+            pass
+
+    info["format"] = "plain-text"
+    print(f"history inspect: {label} bytes={len(blob)} utf8=yes format=plain-text fields=[] lines={len(lines)}", flush=True)
+    return info
+
+
+def parse_rows(blob: bytes):
+    try:
+        text = blob.decode("utf-8-sig")
+    except Exception:
+        return None, None
+
+    # Expected CSV
+    reader = csv.DictReader(io.StringIO(text))
+    if reader.fieldnames and REQUIRED.issubset(set(reader.fieldnames)):
+        return list(reader), reader.fieldnames
+
+    # TSV with expected field names
+    reader = csv.DictReader(io.StringIO(text), delimiter="\t")
+    if reader.fieldnames and REQUIRED.issubset(set(reader.fieldnames)):
+        return list(reader), reader.fieldnames
+
+    # JSON / JSONL with expected field names
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, list) and all(isinstance(x, dict) for x in obj):
+            fields = sorted(set().union(*(x.keys() for x in obj))) if obj else []
+            if REQUIRED.issubset(set(fields)):
+                return obj, fields
+    except Exception:
+        pass
+
+    try:
+        rows = [json.loads(ln) for ln in text.splitlines() if ln.strip()]
+        if rows and all(isinstance(x, dict) for x in rows):
+            fields = sorted(set().union(*(x.keys() for x in rows)))
+            if REQUIRED.issubset(set(fields)):
+                return rows, fields
+    except Exception:
+        pass
+
     return None, None
 
 
@@ -48,13 +139,19 @@ def collect():
     out, seen, sources = [], set(), []
     parts = sorted((BASE / "history_parts").glob("*.xz"))
     for path in parts:
-        rows, fields = parse_csv(path.read_bytes())
-        if rows is not None:
-            sources.append(f"file:{path.name}:{len(rows)}")
-            print(f"history importer: {path.name} header={fields} rows={len(rows)}", flush=True)
-            add_rows(rows, out, seen)
-        else:
-            print(f"history importer: {path.name} could not be decoded as expected CSV", flush=True)
+        data = path.read_bytes()
+        parsed = False
+        for kind, blob in unpack_candidates(data):
+            inspect_blob(f"{path.name}:{kind}", blob)
+            rows, fields = parse_rows(blob)
+            if rows is not None:
+                sources.append(f"file:{path.name}:{kind}:{len(rows)}")
+                print(f"history importer: {path.name} parser={kind} fields={fields} rows={len(rows)}", flush=True)
+                add_rows(rows, out, seen)
+                parsed = True
+                break
+        if not parsed:
+            print(f"history importer: {path.name} no supported record parser matched", flush=True)
 
     seeds = []
     for i in range(100):
@@ -63,23 +160,22 @@ def collect():
             seeds.append(v)
     if seeds:
         joined = "".join(seeds)
-        candidates = [joined.encode()]
+        candidates = [("seed-text", joined.encode())]
         compact = re.sub(r"\s+", "", joined)
-        try:
-            candidates.append(base64.b64decode(compact + "=" * ((4-len(compact)%4)%4)))
-        except Exception:
-            pass
-        try:
-            candidates.append(base64.urlsafe_b64decode(compact + "=" * ((4-len(compact)%4)%4)))
-        except Exception:
-            pass
-        for idx, blob in enumerate(candidates):
-            rows, fields = parse_csv(blob)
-            if rows is not None:
-                sources.append(f"seed:{idx}:{len(rows)}")
-                print(f"history importer: seed header={fields} rows={len(rows)}", flush=True)
-                add_rows(rows, out, seen)
-                break
+        for name, decoder in (("seed-b64", base64.b64decode), ("seed-urlb64", base64.urlsafe_b64decode)):
+            try:
+                candidates.append((name, decoder(compact + "=" * ((4-len(compact)%4)%4))))
+            except Exception:
+                pass
+        for name, raw in candidates:
+            for kind, blob in unpack_candidates(raw):
+                inspect_blob(f"{name}:{kind}", blob)
+                rows, fields = parse_rows(blob)
+                if rows is not None:
+                    sources.append(f"seed:{name}:{kind}:{len(rows)}")
+                    print(f"history importer: seed parser={name}:{kind} fields={fields} rows={len(rows)}", flush=True)
+                    add_rows(rows, out, seen)
+                    return out, sources
 
     return out, sources
 
